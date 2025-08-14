@@ -7,13 +7,16 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use clap::{Parser, Subcommand};
 use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey, VerifyingKey};
+use k256::elliptic_curve::PrimeField;
 use k256::{FieldBytes, Scalar};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use tiny_http::{Server, Response, Method, StatusCode, Header};
 use std::sync::Arc;
-use k256::elliptic_curve::PrimeField;
+use tiny_http::{Header, Method, Response, Server, StatusCode};
+
+mod tss;
+use tss::{LocalAdditiveTss, Threshold};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct KeyShareFile {
@@ -144,7 +147,6 @@ fn decrypt_private_key(
 }
 
 fn evm_address_from_pubkey(uncompressed_pubkey: &[u8]) -> String {
-    // Uncompressed secp256k1 pubkey is 65 bytes starting with 0x04
     let hash = Keccak256::digest(&uncompressed_pubkey[1..]);
     let addr = &hash[12..];
     format!("0x{}", hex::encode(addr))
@@ -173,23 +175,9 @@ fn main() -> anyhow::Result<()> {
             passphrase_client,
             passphrase_server,
         } => {
-            // Generate ECDSA keypair
-            let signing_key = SigningKey::random(&mut OsRng);
-            let verifying_key = VerifyingKey::from(&signing_key);
-            let pub_uncompressed = verifying_key.to_encoded_point(false).as_bytes().to_vec();
-
-            // Split private key x into x1, x2 with x = x1 + x2 (mod n)
-            let sk_bytes = signing_key.to_bytes();
-            let x_ct = Scalar::from_repr(sk_bytes);
-            let x = if bool::from(x_ct.is_some()) {
-                x_ct.unwrap()
-            } else {
-                anyhow::bail!("invalid scalar repr")
-            };
-            let x1 = Scalar::generate_vartime(&mut OsRng);
-            let x2 = x - x1;
-            let x1_bytes: FieldBytes = x1.to_bytes();
-            let x2_bytes: FieldBytes = x2.to_bytes();
+            // Use TSS abstraction for keygen
+            let mut tss = LocalAdditiveTss::new();
+            let (pub_uncompressed, x1_bytes, x2_bytes) = tss.keygen()?;
 
             // Encrypt each share separately with its own passphrase
             let (ct1, n1, s1) = encrypt_private_key(&passphrase_client, x1_bytes.as_slice());
@@ -237,7 +225,6 @@ fn main() -> anyhow::Result<()> {
             out,
         } => {
             if let Some(url) = cosigner_url {
-                // HTTP mode: send client share and digest to co-signer (very simple HTTP client)
                 use std::io::Write as IoWrite;
                 use std::net::TcpStream;
                 let url = url.trim_end_matches('/').to_string();
@@ -276,7 +263,7 @@ fn main() -> anyhow::Result<()> {
                     anyhow::bail!("bad http response");
                 }
             }
-            // Local mode: require server share and passphrase
+            // Local mode: use TSS abstraction to sign
             let ss_path = share_server.ok_or_else(|| {
                 anyhow::anyhow!("--share-server is required without --cosigner-url")
             })?;
@@ -285,40 +272,24 @@ fn main() -> anyhow::Result<()> {
             })?;
             let sc = load_share(&share_client)?;
             let ss = load_share(&ss_path)?;
-            // Recombine x = x1 + x2 (mod n)
+
             let x1_bytes =
                 decrypt_private_key(&passphrase_client, &sc.encrypted, &sc.nonce, &sc.kdf_salt);
             let x2_bytes =
                 decrypt_private_key(&pass_server, &ss.encrypted, &ss.nonce, &ss.kdf_salt);
-
             let mut fb1 = FieldBytes::default();
             fb1.copy_from_slice(&x1_bytes);
             let mut fb2 = FieldBytes::default();
             fb2.copy_from_slice(&x2_bytes);
-
-            let x1_ct = Scalar::from_repr(fb1);
-            let x1 = if bool::from(x1_ct.is_some()) {
-                x1_ct.unwrap()
-            } else {
-                anyhow::bail!("invalid client share")
-            };
-            let x2_ct = Scalar::from_repr(fb2);
-            let x2 = if bool::from(x2_ct.is_some()) {
-                x2_ct.unwrap()
-            } else {
-                anyhow::bail!("invalid server share")
-            };
-            let x = x1 + x2;
-            let x_bytes = x.to_bytes();
-            let signing_key =
-                SigningKey::from_slice(x_bytes.as_slice()).expect("invalid key bytes");
 
             let d = digest.trim_start_matches("0x").to_string();
             if d.len() != 64 {
                 anyhow::bail!("digest must be 32 bytes hex");
             }
             let digest_bytes = hex::decode(&d)?;
-            let sig: Signature = signing_key.sign_prehash(&digest_bytes).expect("sign");
+
+            let tss = LocalAdditiveTss::new();
+            let sig: Signature = tss.sign_digest(&digest_bytes, &fb1, &fb2)?;
 
             let out_sig = SignatureOut {
                 r: format!("0x{:064x}", sig.r()),
@@ -343,50 +314,118 @@ fn main() -> anyhow::Result<()> {
                 let url = req.url().to_string();
                 match (method, url.as_str()) {
                     (Method::Get, "/healthz") => {
-                        let mut resp = Response::from_string("{\"status\":\"ok\"}").with_status_code(StatusCode(200));
-                        let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap());
+                        let mut resp = Response::from_string("{\"status\":\"ok\"}")
+                            .with_status_code(StatusCode(200));
+                        let _ = resp.add_header(
+                            Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
+                        );
                         let _ = req.respond(resp);
                     }
                     (Method::Post, "/partial_sign") => {
                         let mut body = String::new();
                         if let Err(_) = req.as_reader().read_to_string(&mut body) {
-                            let mut resp = Response::from_string("bad request").with_status_code(StatusCode(400));
-                            let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap());
+                            let mut resp = Response::from_string("bad request")
+                                .with_status_code(StatusCode(400));
+                            let _ = resp.add_header(
+                                Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
+                            );
                             let _ = req.respond(resp);
                             continue;
                         }
-                        let v: serde_json::Value = match serde_json::from_str(&body) { Ok(v)=>v, Err(_)=>{ let mut resp = Response::from_string("bad json").with_status_code(StatusCode(400)); let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap()); let _=req.respond(resp); continue; } };
+                        let v: serde_json::Value = match serde_json::from_str(&body) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                let mut resp = Response::from_string("bad json")
+                                    .with_status_code(StatusCode(400));
+                                let _ = resp.add_header(
+                                    Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
+                                );
+                                let _ = req.respond(resp);
+                                continue;
+                            }
+                        };
                         let x1_hex = v.get("x1").and_then(|x| x.as_str()).unwrap_or("");
                         let digest_hex = v.get("digest").and_then(|x| x.as_str()).unwrap_or("");
                         let passphrase_server = pass.clone();
 
                         // decrypt server share (x2)
-                        let x2_bytes = decrypt_private_key(&passphrase_server, &ss.encrypted, &ss.nonce, &ss.kdf_salt);
+                        let x2_bytes = decrypt_private_key(
+                            &passphrase_server,
+                            &ss.encrypted,
+                            &ss.nonce,
+                            &ss.kdf_salt,
+                        );
                         let mut fb2 = FieldBytes::default();
                         fb2.copy_from_slice(&x2_bytes);
-                        let x2_ct = Scalar::from_repr(fb2);
-                        let x2 = if bool::from(x2_ct.is_some()) { x2_ct.unwrap() } else { let mut resp = Response::from_string("invalid share").with_status_code(StatusCode(400)); let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap()); let _=req.respond(resp); continue; };
+                        let x1_vec = match hex::decode(x1_hex) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                let mut resp = Response::from_string("bad x1")
+                                    .with_status_code(StatusCode(400));
+                                let _ = resp.add_header(
+                                    Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
+                                );
+                                let _ = req.respond(resp);
+                                continue;
+                            }
+                        };
+                        if x1_vec.len() != 32 || digest_hex.len() != 64 {
+                            let mut resp = Response::from_string("bad lengths")
+                                .with_status_code(StatusCode(400));
+                            let _ = resp.add_header(
+                                Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
+                            );
+                            let _ = req.respond(resp);
+                            continue;
+                        }
+                        let mut fb1 = FieldBytes::default();
+                        fb1.copy_from_slice(&x1_vec);
 
-                        // Parse x1, digest
-                        let x1_vec = match hex::decode(x1_hex) { Ok(b)=>b, Err(_)=>{ let mut resp = Response::from_string("bad x1").with_status_code(StatusCode(400)); let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap()); let _=req.respond(resp); continue; } };
-                        if x1_vec.len()!=32 || digest_hex.len()!=64 { let mut resp = Response::from_string("bad lengths").with_status_code(StatusCode(400)); let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap()); let _=req.respond(resp); continue; }
-                        let mut fb1 = FieldBytes::default(); fb1.copy_from_slice(&x1_vec);
-                        let x1_ct = Scalar::from_repr(fb1);
-                        let x1 = if bool::from(x1_ct.is_some()) { x1_ct.unwrap() } else { let mut resp = Response::from_string("invalid x1").with_status_code(StatusCode(400)); let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap()); let _=req.respond(resp); continue; };
-                        let x = x1 + x2;
-                        let x_bytes = x.to_bytes();
-                        let signing_key = SigningKey::from_slice(x_bytes.as_slice()).expect("invalid key bytes");
-                        let digest_bytes = match hex::decode(digest_hex) { Ok(b)=>b, Err(_)=>{ let mut resp = Response::from_string("bad digest").with_status_code(StatusCode(400)); let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap()); let _=req.respond(resp); continue; } };
-                        let sig: Signature = match signing_key.sign_prehash(&digest_bytes) { Ok(s)=>s, Err(_)=>{ let mut resp = Response::from_string("sign error").with_status_code(StatusCode(500)); let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap()); let _=req.respond(resp); continue; } };
-                        let out_sig = SignatureOut { r: format!("0x{:064x}", sig.r()), s: format!("0x{:064x}", sig.s()), v: 27 };
-                        let mut resp = Response::from_string(serde_json::to_string(&out_sig).unwrap()).with_status_code(StatusCode(200));
-                        let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap());
+                        let tss = LocalAdditiveTss::new();
+                        let digest_bytes = match hex::decode(digest_hex) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                let mut resp = Response::from_string("bad digest")
+                                    .with_status_code(StatusCode(400));
+                                let _ = resp.add_header(
+                                    Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
+                                );
+                                let _ = req.respond(resp);
+                                continue;
+                            }
+                        };
+                        let sig: Signature = match tss.sign_digest(&digest_bytes, &fb1, &fb2) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                let mut resp = Response::from_string("sign error")
+                                    .with_status_code(StatusCode(500));
+                                let _ = resp.add_header(
+                                    Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
+                                );
+                                let _ = req.respond(resp);
+                                continue;
+                            }
+                        };
+                        let out_sig = SignatureOut {
+                            r: format!("0x{:064x}", sig.r()),
+                            s: format!("0x{:064x}", sig.s()),
+                            v: 27,
+                        };
+                        let mut resp =
+                            Response::from_string(serde_json::to_string(&out_sig).unwrap())
+                                .with_status_code(StatusCode(200));
+                        let _ = resp.add_header(
+                            Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
+                        );
                         let _ = req.respond(resp);
                     }
                     _ => {
-                        let _ = req.respond(
-                            Response::from_string("not found").with_status_code(StatusCode(404)),
+                        let mut resp =
+                            Response::from_string("not found").with_status_code(StatusCode(404));
+                        let _ = resp.add_header(
+                            Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
                         );
+                        let _ = req.respond(resp);
                     }
                 }
             }
