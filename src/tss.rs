@@ -66,7 +66,7 @@ impl Threshold for LocalAdditiveTss {
 }
 
 #[cfg(feature = "tss_gg18")]
-/// GG18-backed TSS (delegates to LocalAdditiveTss until external GG18 crate is wired)
+/// GG18-backed TSS (currently delegates to LocalAdditiveTss; real integration TBD)
 pub struct Gg18Tss {
     inner: LocalAdditiveTss,
 }
@@ -74,7 +74,9 @@ pub struct Gg18Tss {
 #[cfg(feature = "tss_gg18")]
 impl Gg18Tss {
     pub fn new() -> Self {
-        Self { inner: LocalAdditiveTss::new() }
+        Self {
+            inner: LocalAdditiveTss::new(),
+        }
     }
 }
 

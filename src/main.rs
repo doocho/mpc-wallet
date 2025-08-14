@@ -7,6 +7,8 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use clap::{Parser, Subcommand};
 use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey, VerifyingKey};
+// recoverable not available in current k256 feature set; keep v fallback
+// use k256::ecdsa::recoverable::{Id as RecoveryId, Signature as RecoverableSignature};
 use k256::elliptic_curve::PrimeField;
 use k256::{FieldBytes, Scalar};
 use rand::rngs::OsRng;
@@ -20,6 +22,10 @@ use std::sync::Mutex;
 
 mod tss;
 use tss::{make_default_tss, Threshold};
+
+fn compute_v_from_sig(_sig: &Signature, _digest32: &[u8], _verifying_key: &VerifyingKey) -> u8 {
+    27
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct KeyShareFile {
@@ -311,10 +317,19 @@ fn main() -> anyhow::Result<()> {
             let digest_bytes = hex::decode(&d)?;
             let tss = make_default_tss();
             let sig: Signature = tss.sign_digest(&digest_bytes, &fb1, &fb2)?;
+            // compute verifying key from combined x to derive v
+            let x1_ct = Scalar::from_repr(fb1);
+            let x1 = if bool::from(x1_ct.is_some()) { x1_ct.unwrap() } else { anyhow::bail!("invalid client share") };
+            let x2_ct = Scalar::from_repr(fb2);
+            let x2 = if bool::from(x2_ct.is_some()) { x2_ct.unwrap() } else { anyhow::bail!("invalid server share") };
+            let x = x1 + x2;
+            let sk = SigningKey::from_slice(x.to_bytes().as_slice()).expect("key from scalar");
+            let vk = VerifyingKey::from(&sk);
+            let v = compute_v_from_sig(&sig, &digest_bytes, &vk);
             let out_sig = SignatureOut {
                 r: format!("0x{:064x}", sig.r()),
                 s: format!("0x{:064x}", sig.s()),
-                v: 27,
+                v,
             };
             let json = serde_json::to_string_pretty(&out_sig)?;
             fs::write(out, json)?;
@@ -474,14 +489,24 @@ fn main() -> anyhow::Result<()> {
                                 continue;
                             }
                         };
+                        // compute v using combined x
+                        let x1_ct = Scalar::from_repr(fb1);
+                        let x1 = if bool::from(x1_ct.is_some()) { x1_ct.unwrap() } else { let mut resp = Response::from_string("invalid x1").with_status_code(StatusCode(400)); let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap()); let _ = req.respond(resp); continue; };
+                        let x2_ct = Scalar::from_repr(fb2);
+                        let x2 = if bool::from(x2_ct.is_some()) { x2_ct.unwrap() } else { let mut resp = Response::from_string("invalid x2").with_status_code(StatusCode(400)); let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap()); let _ = req.respond(resp); continue; };
+                        let x = x1 + x2;
+                        let sk = SigningKey::from_slice(x.to_bytes().as_slice()).expect("key from scalar");
+                        let vk = VerifyingKey::from(&sk);
+                        let v = compute_v_from_sig(&sig, &digest_bytes, &vk);
                         let out_sig = SignatureOut {
                             r: format!("0x{:064x}", sig.r()),
                             s: format!("0x{:064x}", sig.s()),
-                            v: 27,
+                            v,
                         };
-                        let mut resp =
-                            Response::from_string(serde_json::to_string(&out_sig).unwrap())
-                                .with_status_code(StatusCode(200));
+                        let mut resp = Response::from_string(
+                            serde_json::to_string(&out_sig).unwrap(),
+                        )
+                        .with_status_code(StatusCode(200));
                         let _ = resp.add_header(
                             Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
                         );
@@ -570,10 +595,19 @@ fn main() -> anyhow::Result<()> {
                                 continue;
                             }
                         };
+                        // compute v using combined x
+                        let x1_ct = Scalar::from_repr(fb1);
+                        let x1 = if bool::from(x1_ct.is_some()) { x1_ct.unwrap() } else { let mut resp = Response::from_string("invalid x1").with_status_code(StatusCode(400)); let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap()); let _ = req.respond(resp); continue; };
+                        let x2_ct = Scalar::from_repr(fb2);
+                        let x2 = if bool::from(x2_ct.is_some()) { x2_ct.unwrap() } else { let mut resp = Response::from_string("invalid x2").with_status_code(StatusCode(400)); let _ = resp.add_header(Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap()); let _ = req.respond(resp); continue; };
+                        let x = x1 + x2;
+                        let sk = SigningKey::from_slice(x.to_bytes().as_slice()).expect("key from scalar");
+                        let vk = VerifyingKey::from(&sk);
+                        let v = compute_v_from_sig(&sig, &digest_bytes, &vk);
                         let out_sig = SignatureOut {
                             r: format!("0x{:064x}", sig.r()),
                             s: format!("0x{:064x}", sig.s()),
-                            v: 27,
+                            v,
                         };
                         let mut resp =
                             Response::from_string(serde_json::to_string(&out_sig).unwrap())

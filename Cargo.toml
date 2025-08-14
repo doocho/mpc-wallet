@@ -3,11 +3,13 @@ name = "mpc-wallet"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-# Enable real GG18 TSS implementation (stubbed for now)
-tss_gg18 = []
-
 authors = []
+
+[features]
+# Enable real GG18 TSS implementation (dependencies are optional and only compiled when this feature is on)
+tss_gg18 = [
+  "dep:multi-party-ecdsa",
+]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -23,3 +25,6 @@ hex = "0.4"
 anyhow = "1.0"
 base64ct = "=1.7.3"
 tiny_http = "0.12"
+
+# Optional GG18 deps (gated behind the tss_gg18 feature)
+multi-party-ecdsa = { git = "https://github.com/ZenGo-X/multi-party-ecdsa", optional = true }
