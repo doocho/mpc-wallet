@@ -55,11 +55,20 @@ Output:
 export MPC_PASSPHRASE_CLIENT="change-me1"
 export MPC_PASSPHRASE_SERVER="change-me2"
 
+# Local mode (requires both shares & passphrases)
 cargo run -- sign \
   --share-client client_share.enc.json \
   --share-server server_share.enc.json \
   --passphrase-client $MPC_PASSPHRASE_CLIENT \
   --passphrase-server $MPC_PASSPHRASE_SERVER \
+  --digest 0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --out sig.json
+
+# HTTP mode (server args not needed)
+cargo run -- sign \
+  --share-client client_share.enc.json \
+  --cosigner-url http://127.0.0.1:8080 \
+  --passphrase-client $MPC_PASSPHRASE_CLIENT \
   --digest 0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   --out sig.json
 ```
@@ -94,14 +103,9 @@ cargo run -- serve \
 ```
 - Endpoints:
   - GET `/healthz` → `{ "status": "ok" }`
-  - POST `/partial_sign` with body:
-    ```json
-    { "x1": "<hex-32-bytes>", "digest": "<64-hex>" }
-    ```
-    Returns:
-    ```json
-    { "r": "0x...", "s": "0x...", "v": 27 }
-    ```
+  - POST `/sign/init` → `{ session_id }` (body: `{ x1, digest }`)
+  - POST `/sign/complete` → `{ r, s, v }` (body: `{ session_id }`)
+  - POST `/partial_sign` (backward-compat single-shot) → `{ r, s, v }` (body: `{ x1, digest }`)
 
 ### Sign using HTTP co-signer
 ```bash
@@ -128,10 +132,10 @@ cargo run -- sign \
 
 - sign
   - `--share-client <PATH>`: client share (default `client_share.enc.json`)
-  - `--share-server <PATH>`: server share (default `server_share.enc.json`)
+  - `--share-server <PATH>`: server share (required only without `--cosigner-url`)
   - `--passphrase-client <STRING>` or env `MPC_PASSPHRASE_CLIENT`
-  - `--passphrase-server <STRING>` or env `MPC_PASSPHRASE_SERVER`
-  - Optional: `--cosigner-url <http://host:port>`: use HTTP co-signer instead of local server share file
+  - `--passphrase-server <STRING>` or env `MPC_PASSPHRASE_SERVER` (required only without `--cosigner-url`)
+  - Optional: `--cosigner-url <http://host:port>`: use HTTP co-signer (two-round protocol)
   - `--digest <HEX>`: 32-byte digest
   - `--out <PATH>`: output signature JSON (default `sig.json`)
 
@@ -147,6 +151,13 @@ cargo run -- sign \
   - `kdf_salt`: 16-byte Argon2 salt
   - `public_key`: uncompressed secp256k1 pubkey (65 bytes, JSON array)
 - `keygen` stores two different encrypted shares representing x1 and x2. Both are required to sign.
+
+## Features
+- `tss_gg18`: switch default TSS to a GG18 implementation (WIP). Build with:
+```bash
+cargo build --features tss_gg18
+```
+Note: Implementation is stubbed; integration with a real GG18 crate is pending.
 
 ## Security notes
 - At rest: no plaintext secret storage; Argon2 + ChaCha20-Poly1305

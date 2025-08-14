@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 mod tss;
-use tss::{LocalAdditiveTss, Threshold};
+use tss::{make_default_tss, Threshold};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct KeyShareFile {
@@ -179,7 +179,7 @@ fn main() -> anyhow::Result<()> {
             passphrase_client,
             passphrase_server,
         } => {
-            let mut tss = LocalAdditiveTss::new();
+            let mut tss = make_default_tss();
             let (pub_uncompressed, x1_bytes, x2_bytes) = tss.keygen()?;
             let (ct1, n1, s1) = encrypt_private_key(&passphrase_client, x1_bytes.as_slice());
             let (ct2, n2, s2) = encrypt_private_key(&passphrase_server, x2_bytes.as_slice());
@@ -263,7 +263,8 @@ fn main() -> anyhow::Result<()> {
                     anyhow::bail!("bad http response on init");
                 };
                 // Round 2: /sign/complete
-                let complete_body = serde_json::to_string(&SignCompleteRequest { session_id: sid })?;
+                let complete_body =
+                    serde_json::to_string(&SignCompleteRequest { session_id: sid })?;
                 let complete_req = format!(
                     "POST /sign/complete HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {len}\r\n\r\n{body}",
                     host = url.trim_start_matches("http://"),
@@ -297,7 +298,8 @@ fn main() -> anyhow::Result<()> {
             let ss = load_share(&ss_path)?;
             let x1_bytes =
                 decrypt_private_key(&passphrase_client, &sc.encrypted, &sc.nonce, &sc.kdf_salt);
-            let x2_bytes = decrypt_private_key(&pass_server, &ss.encrypted, &ss.nonce, &ss.kdf_salt);
+            let x2_bytes =
+                decrypt_private_key(&pass_server, &ss.encrypted, &ss.nonce, &ss.kdf_salt);
             let mut fb1 = FieldBytes::default();
             fb1.copy_from_slice(&x1_bytes);
             let mut fb2 = FieldBytes::default();
@@ -307,7 +309,7 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("digest must be 32 bytes hex");
             }
             let digest_bytes = hex::decode(&d)?;
-            let tss = LocalAdditiveTss::new();
+            let tss = make_default_tss();
             let sig: Signature = tss.sign_digest(&digest_bytes, &fb1, &fb2)?;
             let out_sig = SignatureOut {
                 r: format!("0x{:064x}", sig.r()),
@@ -334,10 +336,8 @@ fn main() -> anyhow::Result<()> {
                 let url = req.url().to_string();
                 match (method, url.as_str()) {
                     (Method::Get, "/healthz") => {
-                        let mut resp =
-                            Response::from_string("{\"status\":\"ok\"}").with_status_code(
-                                StatusCode(200),
-                            );
+                        let mut resp = Response::from_string("{\"status\":\"ok\"}")
+                            .with_status_code(StatusCode(200));
                         let _ = resp.add_header(
                             Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
                         );
@@ -358,10 +358,8 @@ fn main() -> anyhow::Result<()> {
                         let (x1_hex, digest_hex) = match parsed {
                             Ok(v) => (v.x1, v.digest),
                             Err(_) => {
-                                let mut resp =
-                                    Response::from_string("bad json").with_status_code(
-                                        StatusCode(400),
-                                    );
+                                let mut resp = Response::from_string("bad json")
+                                    .with_status_code(StatusCode(400));
                                 let _ = resp.add_header(
                                     Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
                                 );
@@ -372,8 +370,8 @@ fn main() -> anyhow::Result<()> {
                         let x1_vec = match hex::decode(&x1_hex) {
                             Ok(b) => b,
                             Err(_) => {
-                                let mut resp =
-                                    Response::from_string("bad x1").with_status_code(StatusCode(400));
+                                let mut resp = Response::from_string("bad x1")
+                                    .with_status_code(StatusCode(400));
                                 let _ = resp.add_header(
                                     Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
                                 );
@@ -433,10 +431,8 @@ fn main() -> anyhow::Result<()> {
                         let sid = match parsed {
                             Ok(v) => v.session_id,
                             Err(_) => {
-                                let mut resp =
-                                    Response::from_string("bad json").with_status_code(
-                                        StatusCode(400),
-                                    );
+                                let mut resp = Response::from_string("bad json")
+                                    .with_status_code(StatusCode(400));
                                 let _ = resp.add_header(
                                     Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
                                 );
@@ -447,10 +443,8 @@ fn main() -> anyhow::Result<()> {
                         let (fb1, digest_bytes) = match sessions.lock().unwrap().remove(&sid) {
                             Some(v) => v,
                             None => {
-                                let mut resp =
-                                    Response::from_string("unknown session").with_status_code(
-                                        StatusCode(404),
-                                    );
+                                let mut resp = Response::from_string("unknown session")
+                                    .with_status_code(StatusCode(404));
                                 let _ = resp.add_header(
                                     Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
                                 );
@@ -467,7 +461,7 @@ fn main() -> anyhow::Result<()> {
                         );
                         let mut fb2 = FieldBytes::default();
                         fb2.copy_from_slice(&x2_bytes);
-                        let tss = LocalAdditiveTss::new();
+                        let tss = make_default_tss();
                         let sig: Signature = match tss.sign_digest(&digest_bytes, &fb1, &fb2) {
                             Ok(s) => s,
                             Err(_) => {
@@ -485,10 +479,9 @@ fn main() -> anyhow::Result<()> {
                             s: format!("0x{:064x}", sig.s()),
                             v: 27,
                         };
-                        let mut resp = Response::from_string(
-                            serde_json::to_string(&out_sig).unwrap(),
-                        )
-                        .with_status_code(StatusCode(200));
+                        let mut resp =
+                            Response::from_string(serde_json::to_string(&out_sig).unwrap())
+                                .with_status_code(StatusCode(200));
                         let _ = resp.add_header(
                             Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
                         );
@@ -552,7 +545,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         let mut fb1 = FieldBytes::default();
                         fb1.copy_from_slice(&x1_vec);
-                        let tss = LocalAdditiveTss::new();
+                        let tss = make_default_tss();
                         let digest_bytes = match hex::decode(digest_hex) {
                             Ok(b) => b,
                             Err(_) => {
@@ -582,18 +575,17 @@ fn main() -> anyhow::Result<()> {
                             s: format!("0x{:064x}", sig.s()),
                             v: 27,
                         };
-                        let mut resp = Response::from_string(
-                            serde_json::to_string(&out_sig).unwrap(),
-                        )
-                        .with_status_code(StatusCode(200));
+                        let mut resp =
+                            Response::from_string(serde_json::to_string(&out_sig).unwrap())
+                                .with_status_code(StatusCode(200));
                         let _ = resp.add_header(
                             Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
                         );
                         let _ = req.respond(resp);
                     }
                     _ => {
-                        let mut resp = Response::from_string("not found")
-                            .with_status_code(StatusCode(404));
+                        let mut resp =
+                            Response::from_string("not found").with_status_code(StatusCode(404));
                         let _ = resp.add_header(
                             Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
                         );
