@@ -1,40 +1,40 @@
 ## MPC 2-of-2 Wallet (MVP scaffold)
 
-A Rust CLI that follows the PRD to demonstrate a local MPC-style wallet flow. The current MVP is a scaffold that uses a single ECDSA keypair under the hood to unblock the CLI and storage flows. It encrypts the key at rest, derives an EVM-compatible address, signs a provided 32-byte digest, and prints JSON outputs for scripting.
+A Rust CLI that follows the PRD to demonstrate a local MPC-style wallet flow. The current MVP enforces 2-of-2 participation by splitting the private key into two additive shares and requiring both to sign. This is a scaffold; actual interactive TSS (e.g., GG18/GG20) is not yet integrated.
 
 ### Status
-- Implements CLI commands: `keygen`, `address`, `sign`, `health`
-- Encrypted-at-rest key storage (Argon2 KDF + ChaCha20-Poly1305)
-- EVM address derivation from secp256k1 public key
-- JSON outputs for easy scripting
-- Note: Real 2-of-2 threshold signing is not yet integrated; both `client_share` and `server_share` files are identical placeholders for now
+- CLI: `keygen`, `address`, `sign`, `health`
+- 2-of-2 enforcement: private key split into two scalar shares x1, x2 with x = x1 + x2 (mod n); both are required for signing (recombined in-memory)
+- Storage: encrypted-at-rest (Argon2 KDF + ChaCha20-Poly1305)
+- Address: EVM-compatible derivation from secp256k1 uncompressed public key
+- Output: JSON for scripting
 
 ## Requirements
-- Rust (stable) and Cargo installed
+- Rust (stable) and Cargo
 
 ## Build
 ```bash
 cargo build --release
 ```
-
-The compiled binary will be at `target/release/mpc-wallet`.
+Binary: `target/release/mpc-wallet`
 
 ## Quick start
-Set a passphrase (can also be provided with `--passphrase`):
+
+### 1) Generate key material (creates two encrypted shares)
+- Uses a single passphrase for both shares in the current MVP
 ```bash
 export MPC_PASSPHRASE="change-me"
-```
 
-### Generate key material
-```bash
-cargo run -- keygen --out-client client_share.enc.json --out-server server_share.enc.json
+cargo run -- keygen \
+  --out-client client_share.enc.json \
+  --out-server server_share.enc.json
 ```
-Output (example):
+Output:
 ```json
 {"address":"0xabc123..."}
 ```
 
-### Show address from a share
+### 2) Show address from a share
 ```bash
 cargo run -- address --share client_share.enc.json
 ```
@@ -43,25 +43,29 @@ Output:
 {"address":"0xabc123..."}
 ```
 
-### Sign a 32-byte digest
-- Provide a 32-byte hex string (with or without `0x` prefix)
+### 3) Sign a 32-byte digest (requires both shares)
+- Provide 32-byte hex digest (with or without `0x` prefix)
+- Use separate env vars for each share’s passphrase when signing
 ```bash
-cargo run -- sign --share client_share.enc.json --digest 0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --out sig.json
+export MPC_PASSPHRASE_CLIENT="pass-client"
+export MPC_PASSPHRASE_SERVER="pass-server"
+
+cargo run -- sign \
+  --share-client client_share.enc.json \
+  --share-server server_share.enc.json \
+  --digest 0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --out sig.json
 ```
-Console output:
+Console:
 ```json
 {"status":"ok"}
 ```
-File `sig.json` example:
+File `sig.json`:
 ```json
-{
-  "r": "0x...",
-  "s": "0x...",
-  "v": 27
-}
+{"r":"0x...","s":"0x...","v":27}
 ```
 
-### Health check
+### 4) Health check
 ```bash
 cargo run -- health
 ```
@@ -71,63 +75,61 @@ Output:
 ```
 
 ## Command reference
-- `keygen`
-  - `--out-client <PATH>`: output path for client share file (default `client_share.enc.json`)
-  - `--out-server <PATH>`: output path for server share file (default `server_share.enc.json`)
-  - `--passphrase <STRING>` or env `MPC_PASSPHRASE`: passphrase for encryption
+- keygen
+  - `--out-client <PATH>`: client share output (default `client_share.enc.json`)
+  - `--out-server <PATH>`: server share output (default `server_share.enc.json`)
+  - `--passphrase <STRING>` or env `MPC_PASSPHRASE`: passphrase for encryption (applied to both shares in MVP)
 
-- `address`
+- address
   - `--share <PATH>`: share file path (default `client_share.enc.json`)
   - `--passphrase <STRING>` or env `MPC_PASSPHRASE`
 
-- `sign`
-  - `--share <PATH>`: share file path (default `client_share.enc.json`)
-  - `--passphrase <STRING>` or env `MPC_PASSPHRASE`
-  - `--digest <HEX>`: 32-byte digest to sign
-  - `--out <PATH>`: output JSON file for signature (default `sig.json`)
+- sign
+  - `--share-client <PATH>`: client share (default `client_share.enc.json`)
+  - `--share-server <PATH>`: server share (default `server_share.enc.json`)
+  - `--passphrase-client <STRING>` or env `MPC_PASSPHRASE_CLIENT`
+  - `--passphrase-server <STRING>` or env `MPC_PASSPHRASE_SERVER`
+  - `--digest <HEX>`: 32-byte digest
+  - `--out <PATH>`: output signature JSON (default `sig.json`)
 
-- `health`: prints `{"status":"ok"}`
+- health
+  - Prints `{"status":"ok"}`
 
 ## Configuration
-- `MPC_PASSPHRASE`: passphrase for encrypting/decrypting the share file
+- `MPC_PASSPHRASE`: passphrase for encrypting/decrypting shares at keygen/address
+- `MPC_PASSPHRASE_CLIENT`, `MPC_PASSPHRASE_SERVER`: passphrases for sign step
 
 ## Data and storage
-- The share files are JSON with the following fields:
-  - `encrypted`: ciphertext bytes (base-10 JSON array)
+- `KeyShareFile` (JSON):
+  - `encrypted`: ciphertext bytes (JSON array)
   - `nonce`: 12-byte AEAD nonce
-  - `kdf_salt`: random salt used for Argon2
-  - `public_key`: uncompressed secp256k1 public key (65 bytes, JSON array)
-
-These are meant for programmatic use; do not edit manually.
+  - `kdf_salt`: 16-byte Argon2 salt
+  - `public_key`: uncompressed secp256k1 pubkey (65 bytes, JSON array)
+- `keygen` stores two different encrypted shares representing x1 and x2. Both are required to sign.
 
 ## Security notes
-- Secrets are never stored in plaintext on disk; they are encrypted with `Argon2` + `ChaCha20-Poly1305`
-- This scaffold uses a single-party key internally; the `server_share` file is a placeholder. Real 2-of-2 MPC/TSS will replace this with proper partial shares and interactive protocols
-- Avoid committing share files; keep passphrases out of shell history when possible
+- At rest: no plaintext secret storage; Argon2 + ChaCha20-Poly1305
+- 2-of-2 enforcement: both shares required; this MVP recombines locally in memory for signing
+- Scaffold: not a real TSS protocol; replace with audited threshold ECDSA (GG18/GG20) in future
+- Keep passphrases secure; avoid committing share files
 
-## Roadmap (from PRD)
-- M1: Local MPC keygen (current scaffold in place; upgrade to real TSS next)
-- M2: Signing with TSS producing `(r, s, v)`
+## Roadmap (per PRD)
+- M1: Local MPC keygen (current scaffold with additive shares)
+- M2: Threshold signing producing `(r, s, v)` with real TSS
 - M3: Broadcast via EVM JSON-RPC
 - M4: Backup export/import flows
-- M5: Optional local HTTP service for key flows
+- M5: Optional local HTTP service
 
 ### Known limitations
-- `v` is currently fixed to `27`. EIP-155 and recovery-id handling to be added with broadcast flow
-- No RPC/broadcast yet
-- No backup import/export CLI yet
+- `v` fixed to 27 (no EIP-155 nor recovery-id handling yet)
+- No RPC/broadcast, no backup import/export, no HTTP service yet
+- Share recombination is local (not interactive MPC)
 
 ## Development
-Run with live builds:
 ```bash
 cargo run -- <args>
-```
-Run tests (add as features are implemented):
-```bash
 cargo test
 ```
 
 ## License
 MIT
-
-

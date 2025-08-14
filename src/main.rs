@@ -7,15 +7,16 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use clap::{Parser, Subcommand};
 use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey, VerifyingKey};
+use k256::elliptic_curve::{Field, PrimeField};
+use k256::{FieldBytes, Scalar};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use zeroize::Zeroize;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct KeyShareFile {
-    // In a real TSS this would be a partial share. For MVP scaffold, we store a full private key
-    // to unblock CLI flows. Replace with TSS integration later.
+    // For MVP scaffold, this file stores one additive share (not a full key).
+    // Real TSS should replace this with protocol-specific share and metadata.
     encrypted: Vec<u8>,
     nonce: [u8; 12],
     kdf_salt: Vec<u8>,
@@ -43,10 +44,10 @@ enum Commands {
         /// Output path for client share file
         #[arg(long, default_value = "client_share.enc.json")]
         out_client: PathBuf,
-        /// Output path for server share file (simulated)
+        /// Output path for server share file
         #[arg(long, default_value = "server_share.enc.json")]
         out_server: PathBuf,
-        /// Passphrase for encryption
+        /// Passphrase for encryption (applied to both shares in MVP)
         #[arg(long, env = "MPC_PASSPHRASE")]
         passphrase: String,
     },
@@ -59,14 +60,20 @@ enum Commands {
         #[arg(long, env = "MPC_PASSPHRASE")]
         passphrase: String,
     },
-    /// Sign a 32-byte digest and output r,s,v
+    /// Sign a 32-byte digest and output r,s,v (requires both client & server shares)
     Sign {
-        /// Share file path
+        /// Client share file path
         #[arg(long, default_value = "client_share.enc.json")]
-        share: PathBuf,
-        /// Passphrase
-        #[arg(long, env = "MPC_PASSPHRASE")]
-        passphrase: String,
+        share_client: PathBuf,
+        /// Server share file path
+        #[arg(long, default_value = "server_share.enc.json")]
+        share_server: PathBuf,
+        /// Client passphrase
+        #[arg(long, env = "MPC_PASSPHRASE_CLIENT")]
+        passphrase_client: String,
+        /// Server passphrase
+        #[arg(long, env = "MPC_PASSPHRASE_SERVER")]
+        passphrase_server: String,
         /// Hex-encoded 32-byte digest (0x... or hex)
         #[arg(long)]
         digest: String,
@@ -102,7 +109,12 @@ fn encrypt_private_key(passphrase: &str, secret_key_bytes: &[u8]) -> (Vec<u8>, [
     (ciphertext, nonce_bytes, salt_bytes)
 }
 
-fn decrypt_private_key(passphrase: &str, ciphertext: &[u8], nonce: &[u8; 12], salt: &[u8]) -> Vec<u8> {
+fn decrypt_private_key(
+    passphrase: &str,
+    ciphertext: &[u8],
+    nonce: &[u8; 12],
+    salt: &[u8],
+) -> Vec<u8> {
     let key = derive_key_from_passphrase(passphrase, salt);
     let cipher = ChaCha20Poly1305::new(&key);
     let nonce = Nonce::from_slice(nonce);
@@ -135,49 +147,91 @@ fn load_share(filepath: &PathBuf) -> anyhow::Result<KeyShareFile> {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Keygen { out_client, out_server, passphrase } => {
-            // Scaffold: generate one ECDSA keypair; store the same encrypted key twice to simulate 2-of-2 parties.
+        Commands::Keygen {
+            out_client,
+            out_server,
+            passphrase,
+        } => {
+            // Generate ECDSA keypair
             let signing_key = SigningKey::random(&mut OsRng);
             let verifying_key = VerifyingKey::from(&signing_key);
             let pub_uncompressed = verifying_key.to_encoded_point(false).as_bytes().to_vec();
-            let mut sk_bytes = signing_key.to_bytes().to_vec();
-            let (ciphertext, nonce, salt) = encrypt_private_key(&passphrase, &sk_bytes);
-            let share = KeyShareFile {
-                encrypted: ciphertext.clone(),
-                nonce,
-                kdf_salt: salt.clone(),
+
+            // Split private key x into x1, x2 with x = x1 + x2 (mod n)
+            let sk_bytes = signing_key.to_bytes();
+            let x = Scalar::from_repr_vartime(sk_bytes).expect("scalar repr");
+            let x1 = Scalar::random(&mut OsRng);
+            let x2 = x - x1;
+            let x1_bytes: FieldBytes = x1.to_bytes();
+            let x2_bytes: FieldBytes = x2.to_bytes();
+
+            // Encrypt each share separately (using same passphrase for MVP)
+            let (ct1, n1, s1) = encrypt_private_key(&passphrase, x1_bytes.as_slice());
+            let (ct2, n2, s2) = encrypt_private_key(&passphrase, x2_bytes.as_slice());
+
+            let share_client = KeyShareFile {
+                encrypted: ct1,
+                nonce: n1,
+                kdf_salt: s1,
                 public_key: pub_uncompressed.clone(),
             };
-            save_share(&out_client, &share)?;
-            save_share(&out_server, &share)?;
+            let share_server = KeyShareFile {
+                encrypted: ct2,
+                nonce: n2,
+                kdf_salt: s2,
+                public_key: pub_uncompressed.clone(),
+            };
 
-            // Zeroize secret from memory
-            sk_bytes.zeroize();
+            save_share(&out_client, &share_client)?;
+            save_share(&out_server, &share_server)?;
 
             let address = evm_address_from_pubkey(&pub_uncompressed);
             println!("{}", serde_json::json!({"address": address}));
         }
         Commands::Address { share, passphrase } => {
             let share = load_share(&share)?;
-            let _ = decrypt_private_key(&passphrase, &share.encrypted, &share.nonce, &share.kdf_salt);
+            let _ =
+                decrypt_private_key(&passphrase, &share.encrypted, &share.nonce, &share.kdf_salt);
             let address = evm_address_from_pubkey(&share.public_key);
             println!("{}", serde_json::json!({"address": address}));
         }
-        Commands::Sign { share, passphrase, digest, out } => {
-            let share = load_share(&share)?;
-            let sk_bytes = decrypt_private_key(&passphrase, &share.encrypted, &share.nonce, &share.kdf_salt);
-            let signing_key = SigningKey::from_slice(&sk_bytes).expect("invalid key bytes");
+        Commands::Sign {
+            share_client,
+            share_server,
+            passphrase_client,
+            passphrase_server,
+            digest,
+            out,
+        } => {
+            let sc = load_share(&share_client)?;
+            let ss = load_share(&share_server)?;
+            // Recombine x = x1 + x2 (mod n)
+            let x1_bytes =
+                decrypt_private_key(&passphrase_client, &sc.encrypted, &sc.nonce, &sc.kdf_salt);
+            let x2_bytes =
+                decrypt_private_key(&passphrase_server, &ss.encrypted, &ss.nonce, &ss.kdf_salt);
 
-            let mut d = digest.trim_start_matches("0x").to_string();
+            let mut fb1 = FieldBytes::default();
+            fb1.copy_from_slice(&x1_bytes);
+            let mut fb2 = FieldBytes::default();
+            fb2.copy_from_slice(&x2_bytes);
+
+            let x1 = Scalar::from_repr_vartime(fb1)
+                .ok_or_else(|| anyhow::anyhow!("invalid client share"))?;
+            let x2 = Scalar::from_repr_vartime(fb2)
+                .ok_or_else(|| anyhow::anyhow!("invalid server share"))?;
+            let x: Scalar = x1 + x2;
+            let x_bytes = x.to_bytes();
+            let signing_key =
+                SigningKey::from_slice(x_bytes.as_slice()).expect("invalid key bytes");
+
+            let d = digest.trim_start_matches("0x").to_string();
             if d.len() != 64 {
                 anyhow::bail!("digest must be 32 bytes hex");
             }
             let digest_bytes = hex::decode(&d)?;
             let sig: Signature = signing_key.sign_prehash(&digest_bytes).expect("sign");
 
-            // EVM v calculation naive (no chain id/EIP-155 here; assuming 27/28 based on recovery id)
-            // k256 doesn't expose recovery id from prehash sign; this is a simplified output for MVP.
-            // We set v to 27 for now.
             let out_sig = SignatureOut {
                 r: format!("0x{:064x}", sig.r()),
                 s: format!("0x{:064x}", sig.s()),
